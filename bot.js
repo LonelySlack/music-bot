@@ -1,4 +1,4 @@
-import { Client, GatewayIntentBits, EmbedBuilder, SlashCommandBuilder, REST, Routes, ActionRowBuilder, ButtonBuilder, ButtonStyle, MessageFlags, StringSelectMenuBuilder } from 'discord.js';
+import { Client, GatewayIntentBits, EmbedBuilder, ActivityType, SlashCommandBuilder, REST, Routes, ActionRowBuilder, ButtonBuilder, ButtonStyle, MessageFlags, StringSelectMenuBuilder } from 'discord.js';
 import { joinVoiceChannel, createAudioPlayer, createAudioResource, AudioPlayerStatus, VoiceConnectionStatus, entersState, NoSubscriberBehavior, StreamType } from '@discordjs/voice';
 import { execFile, spawn } from 'child_process';
 import { promisify } from 'util';
@@ -300,6 +300,7 @@ async function playSong(guildId, seekSeconds = 0, { relocate = true } = {}) {
       }
     }
     q.playing = false; q.current = null;
+    updatePresence();
     if (q.npMessage) { try { await q.npMessage.delete(); } catch {} q.npMessage = null; }
     if (q.textChannel) q.textChannel.send(`📭 Queue empty. Add more with \`${PREFIX} play <song>\`! (I'll leave if idle for 5 min.)`);
     scheduleLeave(guildId, 'idle', IDLE_LEAVE_MS);
@@ -315,6 +316,7 @@ async function playSong(guildId, seekSeconds = 0, { relocate = true } = {}) {
     } catch { q.songs.shift(); return playSong(guildId); }
   }
   q.playing = true; q.paused = false; q.current = song;
+  updatePresence();
   clearLeave(q); // a song is starting — cancel any pending idle/alone disconnect
   console.log(`[${guildId}] ▶ ${song.title}${seekSeconds ? ` @${seekSeconds}s` : ''}`);
 
@@ -358,6 +360,35 @@ async function playSong(guildId, seekSeconds = 0, { relocate = true } = {}) {
 function currentPosition(q) {
   const ref = q.paused && q.pausedAt ? q.pausedAt : Date.now();
   return Math.max(0, Math.floor((ref - q.startedAt) / 1000) + (q.seekOffset || 0));
+}
+
+/* ============================ presence ============================ */
+// The bot's Discord status mirrors what it's actually doing: with one server
+// playing we show that track, with several a track from one would misrepresent
+// the rest. Discord rate-limits presence updates, so we only push on change.
+// Noise publishers glue onto YouTube titles. Deliberately tight — "(feat. …)",
+// "(Remastered)" and the like carry real information and must survive.
+const TITLE_NOISE = /\s*[\(\[]\s*(?:official\s*(?:music\s*)?(?:video|audio|lyric(?:s)?(?:\s*video)?|visuali[sz]er)?|lyric(?:s)?(?:\s*video)?|audio|visuali[sz]er|m\/?v|hq|hd|full\s*hd|[48]k)\s*[\)\]]/gi;
+function presenceTitle(song) {
+  const t = (song.title || '').replace(TITLE_NOISE, '').replace(/\s{2,}/g, ' ').trim() || song.title || 'music';
+  return t.length > 120 ? t.slice(0, 119) + '…' : t;
+}
+let presenceText = null;
+function updatePresence() {
+  if (!client.user) return;
+  const active = [...queues.values()].filter(q => q.playing && q.current);
+  let text;
+  if (active.length === 1) {
+    const q = active[0];
+    text = `${q.paused ? '⏸️' : '🎵'} ${presenceTitle(q.current)}`;
+  } else if (active.length > 1) {
+    text = `🎵 ${active.length} servers`;
+  } else {
+    text = `${PREFIX} play — music`;
+  }
+  if (text === presenceText) return; // don't spend rate limit re-sending the same line
+  presenceText = text;
+  try { client.user.setActivity(text, { type: ActivityType.Listening }); } catch {}
 }
 
 /* ============================ embeds + buttons ============================ */
@@ -524,10 +555,10 @@ function cmdBack(guild) {
   q.songs.unshift(prev); q.loop = false; clearPrepared(q); q.player.stop();
   return { content: `⏮️ Back to **${prev.title}**.` };
 }
-function cmdStop(guild) { const q = getQueue(guild.id); cleanupQueueFiles(q); q.songs = []; q.loop = false; q.playing = false; q.current = null; q.player?.stop(); return { content: '⏹️ Stopped & cleared.' }; }
-function cmdPause(guild) { const q = getQueue(guild.id); if (!q.playing) return { content: '❌ Nothing playing.' }; q.player.pause(); q.paused = true; q.pausedAt = Date.now(); return { content: '⏸️ Paused.' }; }
-function cmdResume(guild) { const q = getQueue(guild.id); if (q.paused && q.pausedAt) { q.startedAt += Date.now() - q.pausedAt; q.pausedAt = 0; } q.player.unpause(); q.paused = false; return { content: '▶️ Resumed.' }; }
-function cmdLeave(guild) { const q = getQueue(guild.id); cleanupQueueFiles(q); clearLeave(q); q.connection?.destroy(); queues.delete(guild.id); return { content: '👋 Left the voice channel.' }; }
+function cmdStop(guild) { const q = getQueue(guild.id); cleanupQueueFiles(q); q.songs = []; q.loop = false; q.playing = false; q.current = null; q.player?.stop(); updatePresence(); return { content: '⏹️ Stopped & cleared.' }; }
+function cmdPause(guild) { const q = getQueue(guild.id); if (!q.playing) return { content: '❌ Nothing playing.' }; q.player.pause(); q.paused = true; q.pausedAt = Date.now(); updatePresence(); return { content: '⏸️ Paused.' }; }
+function cmdResume(guild) { const q = getQueue(guild.id); if (q.paused && q.pausedAt) { q.startedAt += Date.now() - q.pausedAt; q.pausedAt = 0; } q.player.unpause(); q.paused = false; updatePresence(); return { content: '▶️ Resumed.' }; }
+function cmdLeave(guild) { const q = getQueue(guild.id); cleanupQueueFiles(q); clearLeave(q); q.connection?.destroy(); queues.delete(guild.id); updatePresence(); return { content: '👋 Left the voice channel.' }; }
 function cmdLoop(guild) { const q = getQueue(guild.id); q.loop = !q.loop; return { content: q.loop ? '🔁 Loop ON.' : '➡️ Loop OFF.' }; }
 function cmdShuffle(guild) {
   const q = getQueue(guild.id);
@@ -1169,6 +1200,7 @@ client.once('clientReady', async () => {
     const e = Math.floor((Date.now() - t0) / 1000); const uptime = e > 3600 ? `${Math.floor(e / 3600)}h ${Math.floor(e % 3600 / 60)}m` : e > 60 ? `${Math.floor(e / 60)}m ${e % 60}s` : `${e}s`;
     const qd = {}; for (const [g, q] of queues) qd[g] = { playing: q.playing, current: q.current?.title || null, songs: q.songs.length };
     updateStatus({ uptime, guilds: client.guilds.cache.size, queues: qd });
+    updatePresence();
   }, 3000);
   // Live progress bar: refresh each active panel in place every 10s (no new messages).
   setInterval(() => {

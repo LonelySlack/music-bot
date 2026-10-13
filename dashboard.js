@@ -431,8 +431,8 @@ export function startDashboard(port = 3000, ctrl = null) {
   // for the specific server it's viewing.
   setInterval(() => { if (controller && clients.size) pushPlayerState(); }, 1000);
 
-  server.listen(port, '0.0.0.0', () => {
-    console.log(`📊 Dashboard running at http://0.0.0.0:${port}`);
+  server.listen(port, '127.0.0.1', () => {
+    console.log(`📊 Dashboard running at http://127.0.0.1:${port}`);
   });
 }
 
